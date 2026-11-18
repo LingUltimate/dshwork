@@ -1,0 +1,384 @@
+# DSH Android 构建模板
+#
+# 由手表端 App 的 cloud_build 工具触发，用来在云端构建本项目的 APK ——
+# 手表上改代码、云端出可安装的包，这是本机永远做不到的那一类需求。
+#
+# 说明：release 包必须签名才能安装。仓库里不含密钥，所以默认产出的是
+# unsigned 包 —— 能构建、装不上。要云端直接出可安装的包，把 keystore
+# 转成 base64 存进四个 Secrets（见下方 Sign APKs 步骤），不配也能跑，
+# 只是会在 Job Summary 里说明产物未签名。
+
+name: Build APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: '构建类型'
+        required: false
+        type: choice
+        options:
+          - debug
+          - release
+        default: debug
+      source_repo:
+        description: '当前仓库不含源码时，从这个仓库取（owner/repo）'
+        required: false
+        type: string
+        default: dsdzm/DSH-Watch
+      extra_tasks:
+        description: '额外 Gradle 任务（空格分隔），例如单元测试：:app:testDebugUnitTest'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # Android 构建很吃时间：首次要下载 Gradle 与依赖
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      # 目标仓库常常只是用来放 workflow 的（例如 dsdzm/dsh-），里面没有 gradlew —
+      # 手表端 dispatch 时源码没有跟着过来（inputs 装不下整个工程）。
+      # 这种情况从 source_repo 浅克隆一份再构建，而不是在空目录里执行 ./gradlew。
+      - name: Locate project
+        shell: bash
+        env:
+          SOURCE_REPO: ${{ inputs.source_repo }}
+        run: |
+          set -euo pipefail
+          if [ -f gradlew ]; then
+            echo "PROJECT_DIR=." >> "$GITHUB_ENV"
+            echo "当前仓库自带源码，直接构建"
+            exit 0
+          fi
+          if [ -z "${SOURCE_REPO:-}" ]; then
+            echo "::error::当前仓库没有 gradlew，且没有填 source_repo"
+            exit 1
+          fi
+          echo "当前仓库没有 gradlew，从 $SOURCE_REPO 取源码"
+          git clone --depth 1 "https://github.com/$SOURCE_REPO.git" src || {
+            echo "::error::克隆 $SOURCE_REPO 失败 —— 仓库要公开，名字写成 owner/repo"
+            exit 1
+          }
+          echo "PROJECT_DIR=src" >> "$GITHUB_ENV"
+          ls src | head -20
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # 不用 android-actions/setup-android@v3：它默认要装 "tools" 包，
+      # 而该包已从 SDK 仓库下架（日志里的 "Failed to find package 'tools'"），
+      # sdkmanager 返回非零后 action 直接抛错，整个 job 卡在装 SDK 这一步。
+      # runner 镜像本来就自带 Android SDK，这里只补平台与 build-tools。
+      - name: Set up Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          if [ ! -d "$SDK_ROOT" ]; then
+            echo "::error::找不到 Android SDK：$SDK_ROOT"
+            exit 1
+          fi
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+
+          # cmdline-tools 的目录名随镜像版本变化（latest / 16.0 …），找而不是写死
+          SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -maxdepth 3 -type f -name sdkmanager 2>/dev/null | head -1 || true)"
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::找不到 sdkmanager"
+            exit 1
+          fi
+
+          # 镜像里已经有了就别再联网装：runner 换镜像也不会因为源站波动而失败
+          if [ -d "$SDK_ROOT/platforms/android-35" ] && [ -d "$SDK_ROOT/build-tools/35.0.0" ]; then
+            echo "SDK 已就绪，跳过安装"
+          else
+            # 许可证全接受；yes 会被 SIGPIPE 打断，这里不关心它的退出码
+            yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses > /dev/null 2>&1 || true
+            "$SDKMANAGER" --sdk_root="$SDK_ROOT" \
+              "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+          fi
+
+          echo "platforms:"; ls "$SDK_ROOT/platforms"
+          echo "build-tools:"; ls "$SDK_ROOT/build-tools"
+
+      # 不用 actions/cache：它的 key 没有 restore-keys，改一行 build.gradle.kts
+      # 就会让整个 1.6GB 缓存失效。setup-gradle 会带 restore-keys 与 stale 清理。
+      # 注意 cache-provider：v6 默认 enhanced 是闭源商业组件，basic 才是 MIT 开源实现。
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-provider: basic
+          # 旧版 actions/cache 手工缓存了 wrapper；这里显式带上，避免每次重下 Gradle
+          gradle-home-cache-includes: |
+            caches
+            notifications
+            wrapper
+
+      # Gradle 缓存按仓库指纹隔离（descriptor 路径里的 hash），换源 = 旧缓存全部
+      # 不命中，那一次要全量重下约 470MB。所以这里先测速，只有上游快 1.5 倍以上
+      # 才把 google() 提到阿里云前面；两个源都测不到时保持原样。
+      - name: Probe Maven sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          SETTINGS="settings.gradle.kts"
+          if [ ! -f "$SETTINGS" ]; then
+            echo "没有 $SETTINGS，跳过测速"
+            exit 0
+          fi
+
+          AGP_VERSION="$(sed -n 's/^agp[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' gradle/libs.versions.toml 2>/dev/null | head -1 || true)"
+          AGP_VERSION="${AGP_VERSION:-8.7.3}"
+          POM_PATH="com/android/tools/build/gradle/${AGP_VERSION}/gradle-${AGP_VERSION}.pom"
+
+          # 一次请求同时拿状态码与耗时；三次取最小，单次抖动不影响结论。
+          # 404/5xx 不能算「快」——否则一个失败的源反而会被选中。
+          probe() {
+            local url="$1" best=99999 i out code t ms
+            for i in 1 2 3; do
+              out="$(curl -L -sS -o /dev/null --connect-timeout 4 --max-time 8 \
+                -w '%{http_code} %{time_total}' "$url" 2>/dev/null || true)"
+              code="${out%% *}"
+              t="${out##* }"
+              [ "$code" = "200" ] || continue
+              [ -z "$t" ] && continue
+              ms="$(awk -v t="$t" 'BEGIN { printf "%d", t * 1000 }')"
+              if [ "$ms" -lt "$best" ]; then best="$ms"; fi
+            done
+            echo "$best"
+          }
+
+          ALIYUN_RTT="$(probe "https://maven.aliyun.com/repository/google/$POM_PATH")"
+          UPSTREAM_RTT="$(probe "https://dl.google.com/dl/android/maven2/$POM_PATH")"
+          echo "RTT — 阿里云: ${ALIYUN_RTT}ms 上游: ${UPSTREAM_RTT}ms（99999 表示三次都失败）"
+
+          SWITCH="false"
+          if [ "$ALIYUN_RTT" -lt 99999 ] && [ "$UPSTREAM_RTT" -lt 99999 ]; then
+            if [ $((UPSTREAM_RTT * 3)) -lt $((ALIYUN_RTT * 2)) ]; then
+              SWITCH="true"
+            fi
+          fi
+
+          if [ "$SWITCH" = "true" ]; then
+            echo "上游快 1.5 倍以上，切换为 google() 优先"
+            python3 -c '
+          import re, sys
+          p = sys.argv[1]
+          text = open(p).read()
+          text, n = re.subn(
+              r"([ \t]*)(maven\(\"https://maven\.aliyun\.com/repository/google\"\)[^\n]*\n)((?:[^\n}]*\n)*?)([ \t]*google\(\)\n)",
+              r"\4\1\2\3",
+              text
+          )
+          open(p, "w").write(text)
+          print("仓库顺序已切换（%d 处）" % n)
+          ' "$SETTINGS"
+          else
+            echo "保持阿里云优先（未达到 1.5 倍差距）"
+          fi
+
+          {
+            echo "### Maven 源测速"
+            echo ""
+            echo "| 源 | 最小 RTT |"
+            echo "| --- | --- |"
+            echo "| 阿里云 | ${ALIYUN_RTT}ms |"
+            echo "| 上游 google | ${UPSTREAM_RTT}ms |"
+            echo "| 决定 | $([ "$SWITCH" = "true" ] && echo "google() 优先" || echo "阿里云优先") |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Gradle 4G + Kotlin daemon 1.5G 在 7G 的私有 Runner 上只剩 1.4G 余量，
+      # R8 很容易把 daemon 撑死（日志里的 daemon disappeared）。按实际内存分配：
+      # Gradle 44%（2048–4096），Kotlin daemon 20%（1024–1536）。
+      - name: Tune JVM memory
+        shell: bash
+        run: |
+          set -euo pipefail
+          TOTAL_MB="$(awk '/MemTotal/ { printf "%d", $2 / 1024 }' /proc/meminfo)"
+
+          GRADLE_MX=$(( TOTAL_MB * 44 / 100 ))
+          GRADLE_MX=$(( (GRADLE_MX / 50) * 50 ))
+          if [ "$GRADLE_MX" -lt 2048 ]; then GRADLE_MX=2048; fi
+          if [ "$GRADLE_MX" -gt 4096 ]; then GRADLE_MX=4096; fi
+
+          KOTLIN_MX=$(( TOTAL_MB * 20 / 100 ))
+          KOTLIN_MX=$(( (KOTLIN_MX / 100) * 100 ))
+          if [ "$KOTLIN_MX" -lt 1024 ]; then KOTLIN_MX=1024; fi
+          if [ "$KOTLIN_MX" -gt 1536 ]; then KOTLIN_MX=1536; fi
+
+          PROPS="$PROJECT_DIR/gradle.properties"
+          if [ ! -f "$PROPS" ]; then
+            : > "$PROPS"
+          fi
+
+          GRADLE_JVMARGS="-Xmx${GRADLE_MX}m -XX:MaxMetaspaceSize=1024m -Dfile.encoding=UTF-8"
+          if grep -q '^org\.gradle\.jvmargs=' "$PROPS"; then
+            sed -i -E "s#^org\.gradle\.jvmargs=.*#org.gradle.jvmargs=${GRADLE_JVMARGS}#" "$PROPS"
+          else
+            printf '%s\n' "org.gradle.jvmargs=${GRADLE_JVMARGS}" >> "$PROPS"
+          fi
+
+          if grep -q '^kotlin\.daemon\.jvmargs=' "$PROPS"; then
+            sed -i -E "s#^kotlin\.daemon\.jvmargs=.*#kotlin.daemon.jvmargs=-Xmx${KOTLIN_MX}m#" "$PROPS"
+          else
+            printf '%s\n' "kotlin.daemon.jvmargs=-Xmx${KOTLIN_MX}m" >> "$PROPS"
+          fi
+
+          echo "总内存 ${TOTAL_MB}MB → Gradle -Xmx${GRADLE_MX}m / Kotlin daemon -Xmx${KOTLIN_MX}m"
+          {
+            echo "### JVM 堆分配"
+            echo ""
+            echo "总内存 ${TOTAL_MB}MB → Gradle \`-Xmx${GRADLE_MX}m\`，Kotlin daemon \`-Xmx${KOTLIN_MX}m\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build
+        shell: bash
+        run: |
+          set -o pipefail
+          cd "$PROJECT_DIR"
+          ARGS=":app:assemble${{ inputs.variant == 'release' && 'Release' || 'Debug' }}"
+          # 额外任务：想顺手跑单元测试就用它，不必另建一条 workflow。
+          # 放在 assemble 之后 —— 先保证包能出，再让测试决定成败。
+          EXTRA="${{ inputs.extra_tasks }}"
+          if [ -n "$EXTRA" ]; then ARGS="$ARGS $EXTRA"; fi
+          echo "Gradle tasks: $ARGS"
+          chmod +x ./gradlew
+
+          START="$(date +%s)"
+          set +e
+          ./gradlew $ARGS --no-daemon --console=plain --profile 2>&1 | tee "$GITHUB_WORKSPACE/gradle-build.log"
+          RC=${PIPESTATUS[0]}
+          set -e
+          END="$(date +%s)"
+
+          echo "BUILD_EXIT=$RC" >> "$GITHUB_ENV"
+          echo "BUILD_SECONDS=$((END - START))" >> "$GITHUB_ENV"
+          echo "构建耗时 $((END - START))s，退出码 $RC"
+          exit "$RC"
+
+      # 汇总放在独立步骤，构建失败也能跑（if: always），给下一次留下数据
+      - name: Summarize build
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOG="$GITHUB_WORKSPACE/gradle-build.log"
+          CACHE=0
+          FAILED=0
+          DURATION="${BUILD_SECONDS:-0}"
+          if [ -f "$LOG" ]; then
+            CACHE="$(grep -c 'FROM-CACHE' "$LOG" || true)"
+            FAILED="$(grep -c 'FAILED' "$LOG" || true)"
+          fi
+
+          {
+            echo "### Gradle 构建结果"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 退出码 | ${BUILD_EXIT:-unknown} |"
+            echo "| 耗时 | ${DURATION}s |"
+            echo "| FROM-CACHE | ${CACHE} |"
+            echo "| 失败任务 | ${FAILED} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect APKs
+        if: always()
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p dsh-out
+          find "${PROJECT_DIR:-.}/app/build/outputs/apk" -name "*.apk" -exec cp {} dsh-out/ \; || true
+          ls -la dsh-out || true
+
+          # 构建被中断时 Gradle 会留下半截 apk：文件在、能上传、装的时候才报
+          # 「解析软件包时出现问题」。这里当场判死，日志第一屏就能看到原因。
+          shopt -s nullglob
+          for f in dsh-out/*.apk; do
+            if ! unzip -tq "$f" > /dev/null 2>&1; then
+              echo "::error::产物损坏（缺 zip 中央目录，多半是构建中断或磁盘写满）：$f"
+              exit 1
+            fi
+            if [ "$(stat -c%s "$f")" -lt 3000000 ]; then
+              echo "::error::产物只有 $(stat -c%s "$f") 字节，疑似未完成：$f"
+              exit 1
+            fi
+          done
+
+      # 可选签名。四个 Secret 配齐就出可直接安装的包；不配则保持 unsigned，
+      # 但会在 Job Summary 里说清楚「装了会失败」，而不是让人自己猜。
+      - name: Sign APKs
+        if: always()
+        shell: bash
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KS_B64:-}" ] || [ -z "${KS_PASS:-}" ]; then
+            {
+              echo "### 产物未签名"
+              echo ""
+              echo "没有配置 \`ANDROID_KEYSTORE_BASE64\` / \`ANDROID_KEYSTORE_PASSWORD\` / \`ANDROID_KEY_ALIAS\` / \`ANDROID_KEY_PASSWORD\`。"
+              echo "APK 本身是好的，但 Android 拒绝安装未签名的包 —— 下载后需要本地 apksigner 签名。"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          BT="$(ls -d "$ANDROID_HOME"/build-tools/* 2>/dev/null | sort -V | tail -1)"
+          printf '%s' "$KS_B64" | base64 -d > /tmp/dsh-ks.jks
+          trap 'rm -f /tmp/dsh-ks.jks' EXIT
+
+          for f in dsh-out/*.apk; do
+            "$BT/zipalign" -f -p 4 "$f" "$f.aligned"
+            OUT="${f%.apk}"; OUT="${OUT/-unsigned/}-signed.apk"
+            "$BT/apksigner" sign --ks /tmp/dsh-ks.jks --ks-key-alias "${KEY_ALIAS:-dsh}" \
+              --ks-pass "pass:$KS_PASS" --key-pass "pass:${KEY_PASS:-$KS_PASS}" \
+              --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true \
+              --out "$OUT" "$f.aligned"
+            "$BT/apksigner" verify --print-certs "$OUT" | head -3
+            rm -f "$f" "$f.aligned"
+          done
+
+          {
+            echo "### 产物已签名"
+            echo ""
+            echo '| 文件 | 大小 |'
+            echo '| --- | --- |'
+            for f in dsh-out/*.apk; do
+              echo "| \`$(basename "$f")\` | $(stat -c%s "$f") B |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: dsh-out
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload build profile and log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gradle-profile
+          path: |
+            gradle-build.log
+            **/build/reports/profile/*.html
+          if-no-files-found: warn
+          retention-days: 14
